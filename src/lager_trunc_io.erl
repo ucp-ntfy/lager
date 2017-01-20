@@ -41,6 +41,23 @@
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
+% Hack to get around the lack of maps prior to OTP-17.
+% This should only be defined for Dialyzer and XRef - the maps code is
+% suitably guarded for runtime.
+-ifdef(BASHO_CHECK_EXCLUDE_MAPS).
+-define(last_print_3_body(Map, Max, Options),
+    erlang:error(badarg, [Map, Max, Options])).
+-else.
+-define(last_print_3_body(Map, Max, Options),
+    case erlang:is_builtin(erlang, is_map, 1) andalso erlang:is_map(Map) of
+        true ->
+            {MapBody, Len} = map_body(Map, Max - 3, dec_depth(Options)),
+            {[$#, ${, MapBody, $}], Len + 3};
+        false ->
+            error(badarg, [Map, Max, Options])
+    end).
+-endif.
+
 -type option() :: {'depth', integer()}
     | {'lists_as_strings', boolean()}
     | {'force_strings', boolean()}.
@@ -280,13 +297,7 @@ print(List, Max, Options) when is_list(List) ->
     end;
 
 print(Map, Max, Options) ->
-    case erlang:is_builtin(erlang, is_map, 1) andalso erlang:is_map(Map) of
-        true ->
-            {MapBody, Len} = map_body(Map, Max - 3, dec_depth(Options)),
-            {[$#, ${, MapBody, $}], Len + 3};
-        false ->
-            error(badarg, [Map, Max, Options])
-    end.
+    ?last_print_3_body(Map, Max, Options).
 
 %% Returns {List, Length}
 tuple_contents(Tuple, Max, Options) ->
@@ -331,6 +342,8 @@ list_bodyc(X, Max, Options, _Tuple) ->  %% improper list
     {List, Len} = print(X, Max - 1, Options),
     {[$|,List], Len + 1}.
 
+-ifndef(BASHO_CHECK_EXCLUDE_MAPS).
+
 map_body(Map, Max, #print_options{depth=Depth}) when Max < 4; Depth =:= 0 ->
     case erlang:map_size(Map) of
         0 -> {[], 0};
@@ -360,6 +373,8 @@ map_bodyc([{Key, Value} | Rest], Max, Options) ->
     DiffLen2 = DiffLen + ValueLen,
     {Final, FLen} = map_bodyc(Rest, Max - DiffLen2, dec_depth(Options)),
     {[$,, KeyStr, " => ", ValueStr | Final], DiffLen2 + FLen}.
+
+-endif. % BASHO_CHECK_EXCLUDE_MAPS
 
 %% The head of a list we hope is ascii. Examples:
 %%

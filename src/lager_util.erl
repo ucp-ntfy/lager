@@ -124,7 +124,7 @@ level_to_atom(String) ->
 open_logfile(Name, Buffer) ->
     case filelib:ensure_dir(Name) of
         ok ->
-            Options = [append, raw] ++
+            Options = [append] ++
             case  Buffer of
                 {Size, Interval} when is_integer(Interval), Interval >= 0, is_integer(Size), Size >= 0 ->
                     [{delayed_write, Size, Interval}];
@@ -357,7 +357,7 @@ calculate_next_rotation([{date, Date}|T], {{Year, Month, Day}, _} = Now) ->
 trace_filter(Query) ->
     trace_filter(?DEFAULT_TRACER, Query).
 
-%% TODO: Support multiple trace modules 
+%% TODO: Support multiple trace modules
 %-spec trace_filter(Module :: atom(), Query :: 'none' | [tuple()]) -> {ok, any()}.
 trace_filter(Module, Query) when Query == none; Query == [] ->
     {ok, _} = glc:compile(Module, glc:null(false));
@@ -390,7 +390,7 @@ validate_trace(_) ->
 validate_trace_filter(Filter) when is_tuple(Filter), is_atom(element(1, Filter)) =:= false ->
     false;
 validate_trace_filter(Filter) ->
-        case lists:all(fun({Key, '*'}) when is_atom(Key) -> true; 
+        case lists:all(fun({Key, '*'}) when is_atom(Key) -> true;
                           ({Key, '!'}) when is_atom(Key) -> true;
                           ({Key, _Value})      when is_atom(Key) -> true;
                           ({Key, '=', _Value}) when is_atom(Key) -> true;
@@ -403,16 +403,16 @@ validate_trace_filter(Filter) ->
                 false
         end.
 
-trace_all(Query) -> 
+trace_all(Query) ->
 	glc:all(trace_acc(Query)).
 
-trace_any(Query) -> 
+trace_any(Query) ->
 	glc:any(Query).
 
 trace_acc(Query) ->
     trace_acc(Query, []).
 
-trace_acc([], Acc) -> 
+trace_acc([], Acc) ->
 	lists:reverse(Acc);
 trace_acc([{Key, '*'}|T], Acc) ->
 	trace_acc(T, [glc:wc(Key)|Acc]);
@@ -426,7 +426,7 @@ trace_acc([{Key, '>', Val}|T], Acc) ->
 	trace_acc(T, [glc:gt(Key, Val)|Acc]);
 trace_acc([{Key, '<', Val}|T], Acc) ->
 	trace_acc(T, [glc:lt(Key, Val)|Acc]).
-	
+
 
 check_traces(_, _,  [], Acc) ->
     lists:flatten(Acc);
@@ -542,7 +542,7 @@ rotation_calculation_test() ->
 
     ?assertMatch({{2000, 1, 7}, {16, 0, 0}},
         calculate_next_rotation([{day, 5}, {hour, 16}], {{2000, 1, 3}, {17, 34, 43}})),
-    
+
     ?assertMatch({{2000, 1, 3}, {16, 0, 0}},
         calculate_next_rotation([{day, 1}, {hour, 16}], {{1999, 12, 28}, {17, 34, 43}})),
     ok.

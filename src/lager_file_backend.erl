@@ -67,6 +67,8 @@
         formatter :: atom(),
         formatter_config :: any(),
         sync_on :: {'mask', integer()},
+        file_is_writing = false,
+        buffer          = [],
         check_interval = ?DEFAULT_CHECK_INTERVAL :: non_neg_integer(),
         sync_interval = ?DEFAULT_SYNC_INTERVAL :: non_neg_integer(),
         sync_size = ?DEFAULT_SYNC_SIZE :: non_neg_integer(),
@@ -136,7 +138,7 @@ handle_call(_Request, State) ->
 %% @private
 handle_event({log, Message},
     #state{name=Name, level=L,formatter=Formatter,formatter_config=FormatConfig} = State) ->
-    case lager_util:is_loggable(Message,L,{lager_file_backend, Name}) of
+    case lager_util:is_loggable(Message,L,{?MODULE, Name}) of
         true ->
             {ok,write(State, lager_msg:timestamp(Message), lager_msg:severity_as_int(Message), Formatter:format(Message,FormatConfig)) };
         false ->
@@ -150,6 +152,8 @@ handle_info({rotate, File}, #state{name=File,count=Count,date=Date} = State) ->
     _ = lager_util:rotate_logfile(File, Count),
     schedule_rotation(File, Date),
     {ok, State};
+handle_info({file_reply, write_completed, ok}, State) ->
+    {ok, State#state{file_is_writing = false}};
 handle_info(_Info, State) ->
     {ok, State}.
 
@@ -219,27 +223,39 @@ write(#state{name=Name, fd=FD, inode=Inode, flap=Flap, size=RotSize,
             do_write(State, Level, Msg)
     end.
 
-do_write(#state{fd=FD, name=Name, flap=Flap} = State, Level, Msg) ->
+add_buf(State = #state{buffer = Buf}, Msg) ->
+  State#state{buffer = [unicode:characters_to_binary(Msg) | Buf]}.
+
+send_buf(#state{buffer = Buf, fd=FD} = State) ->
+  FD ! {file_request, self(), write_completed, {pwrite, cur, lists:reverse(Buf)}},
+  State#state{buffer = [], file_is_writing = true}.
+
+do_write(#state{file_is_writing = true} = State, _Level, Msg) ->
+  add_buf(State, Msg);
+do_write(#state{file_is_writing = false} = State, _Level, Msg) ->
+  send_buf(add_buf(State, Msg)).
+
     %% delayed_write doesn't report errors
-    _ = file:write(FD, unicode:characters_to_binary(Msg)),
-    {mask, SyncLevel} = State#state.sync_on,
-    case (Level band SyncLevel) /= 0 of
-        true ->
-            %% force a sync on any message that matches the 'sync_on' bitmask
-            Flap2 = case file:datasync(FD) of
-                {error, Reason2} when Flap == false ->
-                    ?INT_LOG(error, "Failed to write log message to file ~s: ~s",
-                        [Name, file:format_error(Reason2)]),
-                    true;
-                ok ->
-                    false;
-                _ ->
-                    Flap
-            end,
-            State#state{flap=Flap2};
-        _ -> 
-            State
-    end.
+%  _ = file:write(FD, unicode:characters_to_binary(Msg)),
+%
+%    {mask, SyncLevel} = State#state.sync_on,
+%    case (Level band SyncLevel) /= 0 of
+%        true ->
+%            %% force a sync on any message that matches the 'sync_on' bitmask
+%            Flap2 = case file:datasync(FD) of
+%                {error, Reason2} when Flap == false ->
+%                    ?INT_LOG(error, "Failed to write log message to file ~s: ~s",
+%                        [Name, file:format_error(Reason2)]),
+%                    true;
+%                ok ->
+%                    false;
+%                _ ->
+%                    Flap
+%            end,
+%            State#state{flap=Flap2};
+%        _ ->
+%            State
+%    end.
 
 validate_loglevel(Level) ->
     try lager_util:config_to_mask(Level) of

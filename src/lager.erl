@@ -112,7 +112,7 @@ do_log(Severity, Metadata, Format, Args, Size, SeverityAsInt, LevelThreshold, Tr
             end,
             LagerMsg = lager_msg:new(Msg,
                 Severity, Metadata, Destinations),
-            case lager_config:get(async, false) of
+            case (lager_config:get(async, false) andalso lager_config:get(async_file_be_buffer, false)) of
                 true ->
                     gen_event:notify(Pid, {log, LagerMsg});
                 false ->

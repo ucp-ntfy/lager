@@ -53,6 +53,7 @@
 -define(DEFAULT_SYNC_INTERVAL, 1000).
 -define(DEFAULT_SYNC_SIZE, 1024*64). %% 64kb
 -define(DEFAULT_CHECK_INTERVAL, 1000).
+-define(DEFAULT_BUFFER_SIZE_THRESHOLD, 1000).
 
 -record(state, {
         name :: string(),
@@ -67,6 +68,10 @@
         formatter :: atom(),
         formatter_config :: any(),
         sync_on :: {'mask', integer()},
+        file_is_writing = false,
+        buffer = [] :: list(),
+        buffer_size = 0 :: non_neg_integer(),
+        buffer_size_threshold = ?DEFAULT_BUFFER_SIZE_THRESHOLD,
         check_interval = ?DEFAULT_CHECK_INTERVAL :: non_neg_integer(),
         sync_interval = ?DEFAULT_SYNC_INTERVAL :: non_neg_integer(),
         sync_size = ?DEFAULT_SYNC_SIZE :: non_neg_integer(),
@@ -104,14 +109,14 @@ init(LogFileConfig) when is_list(LogFileConfig) ->
             {error, {fatal, bad_config}};
         Config ->
             %% probabably a better way to do this, but whatever
-            [RelName, Level, Date, Size, Count, HighWaterMark, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig] =
-              [proplists:get_value(Key, Config) || Key <- [file, level, date, size, count, high_water_mark, sync_interval, sync_size, sync_on, check_interval, formatter, formatter_config]],
+            [RelName, Level, Date, Size, Count, HighWaterMark, SyncInterval, SyncSize, SyncOn, CheckInterval, Formatter, FormatterConfig, BufferSizeThreshold] =
+              [proplists:get_value(Key, Config) || Key <- [file, level, date, size, count, high_water_mark, sync_interval, sync_size, sync_on, check_interval, formatter, formatter_config, buffer_size_threshold]],
             Name = lager_util:expand_path(RelName),
             schedule_rotation(Name, Date),
             Shaper = #lager_shaper{hwm=HighWaterMark},
             State0 = #state{name=Name, level=Level, size=Size, date=Date, count=Count, shaper=Shaper, formatter=Formatter,
                 formatter_config=FormatterConfig, sync_on=SyncOn, sync_interval=SyncInterval, sync_size=SyncSize,
-                check_interval=CheckInterval},
+                check_interval=CheckInterval, buffer_size_threshold = BufferSizeThreshold},
             State = case lager_util:open_logfile(Name, {SyncSize, SyncInterval}) of
                 {ok, {FD, Inode, _}} ->
                     State0#state{fd=FD, inode=Inode};
@@ -119,6 +124,7 @@ init(LogFileConfig) when is_list(LogFileConfig) ->
                     ?INT_LOG(error, "Failed to open log file ~s with error ~s", [Name, file:format_error(Reason)]),
                     State0#state{flap=true}
             end,
+            lager_config:set(async_file_be_buffer, true),
             {ok, State}
     end.
 
@@ -184,6 +190,14 @@ handle_info({rotate, File}, #state{name=File,count=Count,date=Date} = State) ->
     State1 = close_file(State),
     schedule_rotation(File, Date),
     {ok, State1};
+handle_info({file_reply, write_completed, _Reply}, State) ->
+    lager_config:set(async_file_be_buffer, true),
+    case State#state.buffer of
+        [] ->
+            {ok, State#state{file_is_writing = false}};
+        _ ->
+            {ok, send_buf(State)}
+    end;
 handle_info(_Info, State) ->
     {ok, State}.
 
@@ -252,27 +266,25 @@ write(#state{name=Name, fd=FD, inode=Inode, flap=Flap, size=RotSize,
             do_write(State, Level, Msg)
     end.
 
-do_write(#state{fd=FD, name=Name, flap=Flap} = State, Level, Msg) ->
-    %% delayed_write doesn't report errors
-    _ = file:write(FD, unicode:characters_to_binary(Msg)),
-    {mask, SyncLevel} = State#state.sync_on,
-    case (Level band SyncLevel) /= 0 of
-        true ->
-            %% force a sync on any message that matches the 'sync_on' bitmask
-            Flap2 = case file:datasync(FD) of
-                {error, Reason2} when Flap == false ->
-                    ?INT_LOG(error, "Failed to write log message to file ~s: ~s",
-                        [Name, file:format_error(Reason2)]),
-                    true;
-                ok ->
-                    false;
-                _ ->
-                    Flap
-            end,
-            State#state{flap=Flap2};
-        _ ->
-            State
-    end.
+add_buf(State = #state{buffer = Buf, buffer_size = Size, buffer_size_threshold = Threshold}, Msg) ->
+    if Size == Threshold ->
+        lager_config:set(async_file_be_buffer, false);
+    true ->
+        ok
+    end,
+    State#state{
+        buffer = [unicode:characters_to_binary(Msg) | Buf],
+        buffer_size = Size + 1
+    }.
+
+send_buf(#state{buffer = Buf, fd=FD} = State) ->
+    FD ! {file_request, self(), write_completed, {pwrite, cur, lists:reverse(Buf)}},
+    State#state{buffer = [], buffer_size = 0, file_is_writing = true}.
+
+do_write(#state{file_is_writing = true} = State, _Level, Msg) ->
+    add_buf(State, Msg);
+do_write(#state{file_is_writing = false} = State, _Level, Msg) ->
+    send_buf(add_buf(State, Msg)).
 
 validate_loglevel(Level) ->
     try lager_util:config_to_mask(Level) of
@@ -298,6 +310,7 @@ validate_logfile_proplist(List) ->
                             {size, ?DEFAULT_ROTATION_SIZE}, {count, ?DEFAULT_ROTATION_COUNT},
                             {sync_on, validate_loglevel(?DEFAULT_SYNC_LEVEL)}, {sync_interval, ?DEFAULT_SYNC_INTERVAL},
                             {sync_size, ?DEFAULT_SYNC_SIZE}, {check_interval, ?DEFAULT_CHECK_INTERVAL},
+                            {buffer_size_threshold, ?DEFAULT_BUFFER_SIZE_THRESHOLD},
                             {formatter, lager_default_formatter}, {formatter_config, []}
                         ]))
             end
@@ -394,6 +407,13 @@ validate_logfile_proplist([{formatter_config, FmtCfg}|Tail], Acc) ->
             validate_logfile_proplist(Tail, [{formatter_config, FmtCfg}|Acc]);
         false ->
             throw({bad_config, "Invalid formatter config", FmtCfg})
+    end;
+validate_logfile_proplist([{buffer_size_threshold, Threshold}|Tail], Acc) ->
+    case Threshold of
+        Val when is_integer(Val), Val >= 0 ->
+            validate_logfile_proplist(Tail, [{buffer_size_threshold, Val}|Acc]);
+        _ ->
+            throw({bad_config, "Invalid buffer size threshold", Threshold})
     end;
 validate_logfile_proplist([Other|_Tail], _Acc) ->
     throw({bad_config, "Invalid option", Other}).
